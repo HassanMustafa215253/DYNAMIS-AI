@@ -359,7 +359,7 @@ def _assess_group(ids, m, x, v, params, perturbed=False, source=-1):
                     worst = (delta, ids[i1], ids[i2])
             margin = worst[0] / crit
             verdict = _verdict_from_margin(margin, params)
-            reason = (f"planetary: central body {ids[c]}, tightest adjacent pair {worst[1]}-{worst[2]} separated by "
+            reason = (f"planetary: central body {ids[c]}, closest pair {worst[1]}-{worst[2]} separated by "
                       f"{worst[0]:.2f} mutual Hill radii (needs >= {crit:.3g}; margin {margin:.3g})")
     else:
         kind = "hierarchical"
@@ -411,7 +411,6 @@ class StabilityReport:
     t_dyn: float               # dynamical time of the system now
     verdict: str = ""          # 'SETTLED' | 'PENDING' | 'NOT SETTLED'
     reasons: list = field(default_factory=list)
-    unresolved_info: dict = field(default_factory=dict)   # ids tuple -> why it is unresolved
     quiet_span: float = 0.0    # time since the last observed change of structure
     required_span: float = 0.0
     n_records: int = 0
@@ -445,11 +444,8 @@ class StabilityReport:
                 L.append(f"      {_ids_str(ids)}: distance {d['D']:.4g} AU, speed rel. core {d['v']:.4g} AU/yr, "
                          f"energy {d['e']:+.4g}")
         if self.unresolved:
-            L.append("  unresolved (neither bound to the core structure nor on an escape trajectory):")
-            for u in self.unresolved[:8]:
-                L.append(f"      {_ids_str(u, 4)}: {self.unresolved_info.get(u, '')}")
-            if len(self.unresolved) > 8:
-                L.append(f"      ... {len(self.unresolved) - 8} more")
+            L.append("  unresolved (neither bound to the core structure nor on an escape trajectory): "
+                     + ", ".join(_ids_str(u, 4) for u in self.unresolved[:8]))
         L.append("  bodies: " + ", ".join(f"{n} {s}" for s, n in sorted(self.counts().items())))
         period = f"{self.p_max:.4g} yr" if self.p_max == self.p_max else "n/a"
         if self.energy_drift == self.energy_drift:
@@ -1271,7 +1267,7 @@ class GPUNBody:
                                     rmax=0.0, gs=None))
         core = max(objects, key=lambda o: (o["m"], len(o["ids"]), -o["ids"][0]))
 
-        fates, escaping, unresolved, why_map = {}, {}, [], {}
+        fates, escaping, unresolved = {}, {}, []
         label = {"stable": "bound-stable", "marginal": "bound-marginal", "unstable": "bound-unstable",
                  "unresolved": "bound-unresolved"}
         for i in core["ids"]:
@@ -1292,23 +1288,13 @@ class GPUNBody:
                 escaping[o["ids"]] = dict(D=D, e=e_o, v=math.hypot(vrel[0], vrel[1]))
                 st = "escaping"
             else:
-                if e_o <= 0.0:
-                    why = f"bound to the system (e = {e_o:+.3g}) but not to the core group: still interacting"
-                elif float(rel @ vrel) <= 0.0:
-                    why = f"unbound (e = {e_o:+.3g}) but moving inward at D = {D:.3g} AU: it will pass the core again"
-                else:
-                    why = (f"unbound and outbound, but only {D:.3g} AU from the core "
-                           f"(escape needs > {params.escape_factor * scale:.3g} AU)")
                 unresolved.append(o["ids"])
-                why_map[o["ids"]] = why
                 st = "unresolved"
             for i in o["ids"]:
                 fates[i] = st
         p = [g.p_max for g in gstab if g.p_max == g.p_max]
-        rep = StabilityReport(self.t, n, list(core["ids"]), gstab, escaping, unresolved, fates,
-                              max(p) if p else float("nan"), t_dyn, energy=float(self.energy()), r_rms=rms)
-        rep.unresolved_info = why_map
-        return rep
+        return StabilityReport(self.t, n, list(core["ids"]), gstab, escaping, unresolved, fates,
+                               max(p) if p else float("nan"), t_dyn, energy=float(self.energy()), r_rms=rms)
 
     def stability_report(self, monitor=None, params=None, verbose=True):
         """Is the system settled? Every body must be in a bound structure that passes an established stability
@@ -1898,14 +1884,13 @@ def enable_program_point_size(ctx):
 class myEnvironment(arcade.Window):
     def __init__(self, title="", device=None, dtype=torch.float64, force_dtype=None, use_compile=False,
                  kernel="auto", trail_budget=3_000_000, log_bodies=256, log_every=10, trail_fade=False,
-                 group_every=0, stability_every=-1, stability_periods=50.0):
+                 group_every=0, stability_every=-1):
         global global_center_x, global_center_y
         self.device_t, self.dtype, self.force_dtype = device, dtype, force_dtype
         self.use_compile, self.kernel = use_compile, kernel
         self.trail_budget, self.log_bodies, self.log_every = trail_budget, log_bodies, log_every
         self.group_every = group_every
         self.stability_every = stability_every
-        self.stability_periods = stability_periods
         self.is_fullscreen = False
         self.trail_fade = trail_fade
 
@@ -1987,17 +1972,10 @@ class myEnvironment(arcade.Window):
         self.group_rows = []
         self.E0 = float(self.sim.energy())
         # long-term stability: snapshots of the structure so a verdict can demand a long quiet window
-        auto = self.stability_every < 0                       # auto: record every 30 frames once <= 1000 bodies are live
-        every = 30 if auto else self.stability_every
-        self.stability_every, self.stability_auto = every, auto
-        self.monitor = (StabilityMonitor(StabilityParams(min_periods=self.stability_periods))
-                        if (every > 0 and (not auto or n <= 1000)) else None)
-        if every == 0:
-            print("[setup] stability monitor: off (press S for an instantaneous report)")
-        elif self.monitor is None:
-            print(f"[setup] stability monitor: starts automatically once <= 1000 bodies are live (every {every} frames)")
-        else:
-            print(f"[setup] stability monitor: every {every} frames (press S for the report)")
+        every = self.stability_every if self.stability_every >= 0 else (30 if n <= 1000 else 0)
+        self.stability_every = every
+        self.monitor = StabilityMonitor() if every > 0 else None
+        print(f"[setup] stability monitor: {'every %d frames (press S for the report)' % every if every else 'off (press S for an instantaneous report)'}")
         print(f"[setup] N={n}, draw mode={'sprites' if self.use_sprites else 'points'}, "
               f"dtype={self.dtype}, force dtype={self.force_dtype or self.dtype}")
 
@@ -2088,12 +2066,8 @@ class myEnvironment(arcade.Window):
         if self.group_every and self.frame_count % self.group_every == 0:
             self._log_groups(t)
 
-        if self.stability_every > 0 and self.frame_count % self.stability_every == 0:
-            if self.monitor is None and self.stability_auto and n_alive <= 1000:
-                self.monitor = StabilityMonitor(StabilityParams(min_periods=self.stability_periods))
-                print(f"[stability] {n_alive} bodies live: monitor started at t={t:.3f} yr")
-            if self.monitor is not None:
-                self.monitor.record(self.sim)
+        if self.monitor is not None and self.frame_count % self.stability_every == 0:
+            self.monitor.record(self.sim)
 
         if self.hud is not None and self.show_hud and self.frame_count % 6 == 0:
             self.hud.text = (f"t={t:.3f} yr  speed {self.achieved_speed:.3f}/{self.sim_speed:.3f} yr/s  "
@@ -2286,10 +2260,7 @@ if __name__ == "__main__":
                     help="every F frames, log bound-group statistics to simulation_groups.csv (0 = off; O(N^2) per log)")
     ap.add_argument("--stability-every", type=int, default=-1,
                     help="record a stability snapshot every F frames for the long-term verdict (S key / on exit); "
-                         "-1 = auto (every 30 frames, starting once <= 1000 bodies are live), 0 = off")
-    ap.add_argument("--stability-periods", type=float, default=50.0,
-                    help="the structure must stay unchanged for this many periods of the longest bound orbit "
-                         "before the verdict can be SETTLED (default 50; lower = faster but less certain)")
+                         "-1 = auto (30 if N <= 1000, else off), 0 = off")
     ap.add_argument("--trail-fade", action="store_true",
                     help="fade older trail points out (default: off, trails keep full opacity)")
     ap.add_argument("--set-high-perf-gpu", action="store_true")
@@ -2316,6 +2287,6 @@ if __name__ == "__main__":
                         use_compile=args.compile, kernel=args.kernel, trail_budget=args.trail_budget,
                         log_bodies=(args.log_bodies or None), log_every=args.log_every,
                         trail_fade=args.trail_fade, group_every=args.group_every,
-                        stability_every=args.stability_every, stability_periods=args.stability_periods)
+                        stability_every=args.stability_every)
     Env.setup()
     arcade.run()
