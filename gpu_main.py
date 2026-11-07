@@ -41,6 +41,15 @@ Install the fast path (optional, check your CUDA major version first):
     pip install cupy-cuda12x          # if the line above printed 12.x   (cupy-cuda11x for 11.x)
     pip install "cupy-cuda12x[ctk]"   # use this form if CuPy complains about missing CUDA DLLs
 
+Front end (this version)
+    Buttons (top-left): Labels OFF/ID/NAME, Live print, Snapshot, Stability, Speed -/+, Pause.
+    Top-right panel:    simulated time, "run until t = ..." (how long to keep the run going before the outcome is
+                        settled), alive bodies. The estimate needs the stability monitor (on for N <= 1000).
+    Terminal:           only merge events, the short reports you ask for, and a short final verdict.
+                        --verbose restores the old detailed output.
+    Headless (no window, much faster):  python nbody_headless.py -h     (or: python gpu_main.py --headless ...)
+    Scene: edit build_scene() below (the addCelestial calls); the window and the headless runner both use it.
+
 Usage
     python gpu_main.py                          3-body merge demo
     python gpu_main.py --random 5000
@@ -63,6 +72,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import arcade
+import arcade.gui
 import numpy as np
 import torch
 
@@ -76,8 +86,18 @@ global_center_y = 0
 TRAIL_COLORS = [arcade.color.RED, arcade.color.BLUE, arcade.color.GREEN, arcade.color.YELLOW,
                 arcade.color.MAGENTA, arcade.color.PINK, arcade.color.PURPLE]
 
-_init_pos, _init_vel, _init_mass, _init_radius, _init_color = [], [], [], [], []
+_init_pos, _init_vel, _init_mass, _init_radius, _init_color, _init_name = [], [], [], [], [], []
 RANDOM_N = 0
+
+# Terminal output policy: warnings, merge events and the final verdict are always printed; set-up chatter and the
+# long reports only with --verbose (VERBOSE = True).
+VERBOSE = False
+
+
+def say(*args, **kw):
+    """print() that only speaks in --verbose mode."""
+    if VERBOSE:
+        print(*args, **kw)
 
 # ====================================================================================== CUDA kernels
 FORCE_SRC = r"""
@@ -168,7 +188,7 @@ def compute_dt(stats, dt_prev, p):
         if rel_a > 0:
             c.append(p["close_safety"] * math.sqrt(min_dist / rel_a))
         cands.append(max(p["close_min_dt"], min(c)) if c else p["close_min_dt"])
-    target = max(p["dt_min"], min(cands)) / 3
+    target = max(p["dt_min"], min(cands)) / p.get("dt_div", 3.0)   # dt_div = safety divisor (3 = original behaviour)
     return min(target, dt_prev * 1.2)
 # --- END compute_dt
 
@@ -458,6 +478,48 @@ class StabilityReport:
                  "approximate, not a proof for unbounded time.")
         return "\n".join(L)
 
+    def stop_estimate(self):
+        """When can the run be stopped?  Returns (verdict, t_stop, remaining_yr).
+        The structure must stay unchanged for `required_span`, so the earliest possible stop is
+        t_stop = (time of the last structural change) + required_span.
+        SETTLED -> t_stop is when it became settled (remaining 0); PENDING -> run until t_stop if nothing changes;
+        NOT SETTLED -> t_stop is only a lower bound (something is still unstable / interacting)."""
+        t_stop = (self.t - self.quiet_span) + self.required_span
+        return self.verdict, t_stop, max(0.0, t_stop - self.t)
+
+    def stop_line(self):
+        """One-line answer to 'how long do I have to keep this running?'."""
+        v, t_stop, rem = self.stop_estimate()
+        if v == "SETTLED":
+            return f"SETTLED: safe to stop now (settled since t = {t_stop:.3f} yr)"
+        if v == "PENDING":
+            return f"PENDING: run until t = {t_stop:.2f} yr (+{rem:.2f} yr) if nothing changes"
+        return f"NOT SETTLED: cannot stop before t = {t_stop:.2f} yr, and only once the issues clear"
+
+    def brief(self, namer=None, max_reasons=2):
+        """Short terminal report (the full one is summary()). `namer` maps a body id to its display label."""
+        nm = namer or str
+
+        def names(ids, n=6):
+            ids = list(ids)
+            s = ", ".join(nm(i) for i in ids[:n])
+            return "[" + s + (f", +{len(ids) - n} more" if len(ids) > n else "") + "]"
+
+        counts = ", ".join(f"{n} {s}" for s, n in sorted(self.counts().items()))
+        L = [f"t = {self.t:.3f} yr | alive = {self.n_live} ({counts})", f"  {self.stop_line()}"]
+        for g in self.groups:
+            L.append(f"  group {names(g.ids)}: {g.kind}, {g.verdict}")
+        for ids, d in self.escaping.items():
+            L.append(f"  escaping {names(ids)}: {d['D']:.3g} AU from the core, speed {d['v']:.3g} AU/yr")
+        if self.unresolved:
+            L.append("  still interacting: " + ", ".join(names(u, 4) for u in self.unresolved[:4]))
+        if self.verdict != "SETTLED":
+            for r in self.reasons[:max_reasons]:
+                L.append("  - " + (r if len(r) <= 150 else r[:147] + "..."))
+        if self.energy_drift == self.energy_drift:
+            L.append(f"  energy drift since last merger: {self.energy_drift:.1e}")
+        return "\n".join(L)
+
     _min_dyn: float = 10.0
     _min_periods: float = 50.0
 
@@ -593,22 +655,27 @@ class GPUNBody:
         self.ids = torch.arange(n, device=device)
         self.t = 0.0                                          # python floats: dt/t live on the CPU now
 
-        self.dtp = dict(dt_min=1e-3, dt_max=20.0, close_threshold=0.75, close_safety=0.2, close_min_dt=1e-6)
+        self.dtp = dict(dt_min=1e-3, dt_max=20.0, close_threshold=0.75, close_safety=0.2, close_min_dt=1e-6,
+                        dt_div=3.0)
         self.fixed_dt = False
         self.fixed_dt_value = 5e-5
+
+        # merge events (t, [absorbed ids], [absorbing ids], [new masses]); drained by the front end.
+        # Recording costs one small sync per merge call, so it is only on for small systems.
+        self.merge_log = []
+        self.track_merges = n <= 2000
 
         self._tile = _force_tile
         if use_compile:
             try:
                 self._tile = torch.compile(_force_tile, dynamic=True)
-                print("[compute] torch.compile enabled for the eager force tile")
+                say("[compute] torch.compile enabled for the eager force tile")
             except Exception as e:  # pragma: no cover
                 print("[compute] torch.compile unavailable:", e)
 
         self._fused = False
         if kernel != "eager" and device.type == "cuda":
             self._init_fused(strict=(kernel == "cupy"))
-        print(f"[compute] force backend: {'FUSED CUDA kernels (CuPy/NVRTC)' if self._fused else 'PyTorch eager'}")
 
         self.acc, closest, self._phi = self._accel_and_closest()
         self._stats = self._closest_stats(closest)
@@ -625,13 +692,17 @@ class GPUNBody:
             ok, msg = self._selfcheck()
             if not ok:
                 raise RuntimeError("numerical self-check failed: " + msg)
-            print("[compute] fused kernels compiled and verified against the PyTorch path:", msg)
+            say("[compute] fused kernels compiled and verified against the PyTorch path:", msg)
         except Exception as e:
             self._fused = False
-            print(f"[compute] fused kernels NOT used -> PyTorch eager path.\n          reason: {e}\n"
-                  "          (to enable: pip install cupy-cuda12x  [matching torch.version.cuda])")
+            print(f"[compute] WARNING: fused CUDA kernels not used (slower PyTorch path): {str(e).splitlines()[0]}"
+                  "  -> pip install cupy-cuda12x  (match torch.version.cuda)")
             if strict:
                 raise
+
+    @property
+    def backend_name(self):
+        return "fused CUDA kernels" if self._fused else "PyTorch eager"
 
     def _selfcheck(self):
         g = torch.Generator(device="cpu").manual_seed(1)
@@ -785,6 +856,13 @@ class GPUNBody:
                                torch.where(lose[:, None], torch.zeros_like(v), v))
         self.mass = torch.where(win, M, torch.where(lose, zero, m))
         self.rad = torch.where(win, R3.pow(1.0 / 3.0), rad)
+
+        if self.track_merges:
+            li = lose.nonzero().squeeze(1)
+            if li.numel():
+                wi = target[li]
+                self.merge_log.append((self.t + self.dt, self.ids[li].tolist(), self.ids[wi].tolist(),
+                                       self.mass[wi].tolist()))
 
     def _maybe_merge(self):
         """
@@ -1210,14 +1288,14 @@ class GPUNBody:
         groups = self.bound_groups(min_size=min_size, tidal=tidal, tidal_threshold=tidal_threshold)
         if verbose:
             n_live = int((self.mass > 0).sum())
-            seeds = self.pairwise_linked_groups(min_size=2)
-            n_seed = sum(len(s) for s in seeds)
             in_g = sum(g.size for g in groups)
-            print(f"Bound-group analysis  t={self.t:.4f} yr  live bodies={n_live}")
-            print(f"  seeds (components of the pairwise-bound graph, >= 2 bodies): {len(seeds)}, {n_seed} bodies")
-            print(f"  confirmed bound groups (every member bound, group E < 0, >= {min_size} bodies): "
-                  f"{len(groups)}, {in_g} bodies")
-            print(f"  {n_seed - in_g} seed member(s) failed the collective test; {n_live - in_g} live bodies in no group")
+            print(f"Bound groups  t={self.t:.4f} yr  live bodies={n_live}: "
+                  f"{len(groups)} group(s) holding {in_g} bodies, {n_live - in_g} in no group")
+            if VERBOSE:                                    # extra O(N^2) seed analysis only on request
+                seeds = self.pairwise_linked_groups(min_size=2)
+                n_seed = sum(len(s) for s in seeds)
+                print(f"  seeds (pairwise-bound components, >= 2 bodies): {len(seeds)}, {n_seed} bodies; "
+                      f"{n_seed - in_g} seed member(s) failed the collective test")
             if groups:
                 print(f"  {'#':>3} {'size':>6} {'mass':>10} {'E_group':>12} {'2T/|W|':>7} {'r_half':>9} "
                       f"{'tidal':>9}  stripped  members")
@@ -1231,7 +1309,8 @@ class GPUNBody:
             if any(g.perturbed for g in groups):
                 print(f"  * tidal ratio > {tidal_threshold:.3g}: the group extends past an outside body's Hill "
                       "sphere, so its boundness is strongly affected by that body")
-            print("  units: M_sun, AU, yr; E, T, W in the group's own COM frame; r_half about the COM")
+            if VERBOSE:
+                print("  units: M_sun, AU, yr; E, T, W in the group's own COM frame; r_half about the COM")
         return groups
 
     # ====================================================================== long-term stability
@@ -1306,7 +1385,7 @@ class GPUNBody:
         rep = _finalize_report(self._stability_snapshot(params, monitor.r0 if monitor is not None else None),
                                params, monitor)
         if verbose:
-            print(rep.summary())
+            print(rep.summary() if VERBOSE else rep.brief())
         return rep
 
     def diagnostics(self):
@@ -1805,12 +1884,65 @@ class Celestial(arcade.SpriteCircle):
 
 def addCelestial(spriteList=None, sprites_by_id=None, Name="", radius=1, position=(0, 0), mass=0,
                  velocity=(0, 0), acceleration=(0, 0), color=arcade.color.WHITE):
-    """Same call signature as before (first two args ignored; sprites are built in setup())."""
+    """Same call signature as before (first two args ignored; sprites are built in setup()).
+    `Name` is what the NAME labels show (default "Planet<index>")."""
+    _init_name.append(Name or f"Planet{len(_init_pos)}")
     _init_pos.append(position)
     _init_vel.append(velocity)
     _init_mass.append(mass)
     _init_radius.append(radius)
     _init_color.append(color)
+
+
+def build_scene(random_n=None, seed=0):
+    """THE place that defines the initial conditions. The window and nbody_headless.py both call this, so a
+    GUI run and a headless run start from exactly the same state. Edit the addCelestial calls below.
+    Returns (pos, vel, mass, radius_px, colors, names), already shifted to the centre-of-mass frame."""
+    for lst in (_init_pos, _init_vel, _init_mass, _init_radius, _init_color, _init_name):
+        lst.clear()
+    n_rand = RANDOM_N if random_n is None else random_n
+    if n_rand:
+        pos, vel, mass, rad = random_scene(n_rand, seed)
+        colors = [arcade.color.WHITE] * n_rand
+        names = [f"P{i}" for i in range(n_rand)]
+    else:
+        addCelestial(Name="Planet0", radius=5, position=(0, 5), mass=2, velocity=(0, 0))
+        addCelestial(Name="Planet1", radius=5, position=(4.3301, -2.5), mass=2, velocity=(0, 0))
+        addCelestial(Name="Planet2", radius=5, position=(-4.3301, -2.5), mass=2, velocity=(0, 0))
+        pos = np.array(_init_pos, dtype=np.float64)
+        vel = np.array(_init_vel, dtype=np.float64)
+        mass = np.array(_init_mass, dtype=np.float64)
+        rad = np.array(_init_radius, dtype=np.float64)
+        colors, names = list(_init_color), list(_init_name)
+    pos = pos - (pos * mass[:, None]).sum(0) / mass.sum()
+    vel = vel - (vel * mass[:, None]).sum(0) / mass.sum()
+    return pos, vel, mass, rad, colors, names
+
+
+def merge_lines(events, names, members=None, n_alive=None, max_lines=4):
+    """Turn GPUNBody.merge_log events into terminal lines (shared by the window and nbody_headless.py).
+    `members` (body id -> ids it consists of) is updated in place when given. Returns a list of strings."""
+    lines = []
+    for t, lost, won, mass in events:
+        by_winner = {}
+        for l, w, m in zip(lost, won, mass):
+            by_winner.setdefault(w, [m, []])[1].append(l)
+        for w, (m, ls) in by_winner.items():
+            if members is not None:
+                members[w] = members.get(w, [w]) + sum((members.pop(l, [l]) for l in ls), [])
+            lines.append(f"[t = {t:10.3f} yr] MERGE  {' + '.join(names[l] for l in ls)} -> absorbed by "
+                         f"{names[w]} (mass now {m:.4g})")
+    tail = "" if n_alive is None else f"   | alive: {n_alive}"
+    if len(lines) <= max_lines:
+        return [ln + (tail if k == len(lines) - 1 else "") for k, ln in enumerate(lines)]
+    return [f"[t = {events[-1][0]:10.3f} yr] {len(lines)} merges{tail}"]
+
+
+def _tracker_label(mode, bid, names, members):
+    """Label text for body `bid` in label mode 'id' or 'name'; '(+k)' = it has absorbed k other bodies."""
+    base = str(bid) if mode == "id" else names[bid]
+    k = len(members.get(bid, ())) - 1
+    return f"{base} (+{k})" if k > 0 else base
 
 
 POINT_VS = """
@@ -1904,7 +2036,7 @@ class myEnvironment(arcade.Window):
 
         try:
             renderer = self.context.get_info().get_renderer()
-            print(f"[render]  OpenGL renderer: {renderer}")
+            say(f"[render]  OpenGL renderer: {renderer}")
             if "nvidia" not in renderer.lower() and device is not None and device.type == "cuda":
                 print("[render]  NOTE: drawing is NOT on the NVIDIA GPU (physics still is). Use "
                       "--set-high-perf-gpu or set python.exe to 'High performance' in Windows graphics settings.")
@@ -1915,12 +2047,12 @@ class myEnvironment(arcade.Window):
     def setup(self):
         arcade.set_background_color(arcade.color.BLACK)
         self.camera = arcade.Camera2D()
-        self.dragging = False
         self.paused = False
-        self.print_Debug = False
+        self.live_print = False           # P / button: one status line per real second on the terminal
+        self._last_print = 0.0
 
         # time-based stepping: advance a constant amount of SIMULATED time per real second
-        self.sim_speed = 0.5              # simulated years per real second (UP/DOWN to change)
+        self.sim_speed = 0.5              # simulated years per real second (UP/DOWN or buttons)
         self.step_budget_ms = 8.0         # max wall time spent stepping per frame (LEFT/RIGHT to change)
         self.t_goal = 0.0
         self.last_steps = 0
@@ -1932,22 +2064,15 @@ class myEnvironment(arcade.Window):
         self.trail_every = 2              # frames between trail points
         self.planets = arcade.SpriteList()
 
-        if RANDOM_N:
-            pos, vel, mass, rad = random_scene(RANDOM_N)
-            colors = [arcade.color.WHITE] * RANDOM_N
-        else:
-            addCelestial(radius=5, position=(0, 5), mass=2, velocity=(0, 0))
-            addCelestial(radius=5, position=(4.3301, -2.5), mass=2, velocity=(0, 0))
-            addCelestial(radius=5, position=(-4.3301, -2.5), mass=2, velocity=(0, 0))
-            pos = np.array(_init_pos, dtype=np.float64)
-            vel = np.array(_init_vel, dtype=np.float64)
-            mass = np.array(_init_mass, dtype=np.float64)
-            rad = np.array(_init_radius, dtype=np.float64)
-            colors = list(_init_color)
-
-        pos = pos - (pos * mass[:, None]).sum(0) / mass.sum()
-        vel = vel - (vel * mass[:, None]).sum(0) / mass.sum()
+        pos, vel, mass, rad, colors, names = build_scene()
         self.n0 = n = len(mass)
+        self.names = names
+        self.members = {i: [i] for i in range(n)}   # body id -> ids it consists of (itself + everything it absorbed)
+        self.label_mode = "off"                     # off | id | name
+        self.label_max = 150                        # labels are drawn one by one: cap them
+        self._labels = {}                           # body id -> arcade.Text (pooled)
+        self._last_buf = None
+        self.report = None                          # latest finalised StabilityReport (None = not computed yet)
 
         self.sim = GPUNBody(pos, vel, mass, rad, self.device_t, self.dtype, self.force_dtype,
                             use_compile=self.use_compile, kernel=self.kernel)
@@ -1959,7 +2084,7 @@ class myEnvironment(arcade.Window):
         self._n_draw = 0
         if self.use_sprites:
             for i in range(n):
-                s = Celestial("Planet" + str(i), i, rad[i], colors[i])
+                s = Celestial(names[i], i, rad[i], colors[i])
                 self.planets.append(s)
                 self.sprite_of[i] = s
         else:
@@ -1975,9 +2100,13 @@ class myEnvironment(arcade.Window):
         every = self.stability_every if self.stability_every >= 0 else (30 if n <= 1000 else 0)
         self.stability_every = every
         self.monitor = StabilityMonitor() if every > 0 else None
-        print(f"[setup] stability monitor: {'every %d frames (press S for the report)' % every if every else 'off (press S for an instantaneous report)'}")
-        print(f"[setup] N={n}, draw mode={'sprites' if self.use_sprites else 'points'}, "
-              f"dtype={self.dtype}, force dtype={self.force_dtype or self.dtype}")
+
+        fd = self.sim.force_dtype
+        print(f"[setup] N={n} | draw: {'sprites' if self.use_sprites else 'points'} | forces: "
+              f"{self.sim.backend_name}, {'fp32' if fd == torch.float32 else 'fp64'} | stability monitor: "
+              f"{'every %d frames' % every if every else 'off (no stop-time estimate; see --stability-every)'}")
+        print("[keys]  SPACE pause | L labels | P live print | N snapshot | S stability | B groups | D energy | "
+              "UP/DOWN speed | F fullscreen")
 
         try:
             self.hud = arcade.Text("", 10, 10, arcade.color.WHITE, 13)
@@ -1986,8 +2115,148 @@ class myEnvironment(arcade.Window):
             self.hud = None
 
         buf, t, dt, alive = self.sim.fetch_render(global_center_x, global_center_y)
+        self._last_buf = buf
         self._init_trails(buf)
         self._show(buf)
+        self._build_ui()
+        if self.monitor is not None:
+            self._update_report()
+        self._refresh_hud(self.sim.t, self.sim.dt, alive, 0, 0.0)
+
+    # ---------------------------------------------------------------- buttons / info panel (arcade.gui)
+    def _build_ui(self):
+        self.UI = arcade.gui.UIManager()
+        self.UI.enable()
+        root = arcade.gui.UIAnchorLayout()
+
+        def button(text, width, fn):
+            b = arcade.gui.UIFlatButton(text=text, width=width, height=30)
+            b.event("on_click")(lambda event, fn=fn: fn())
+            return b
+
+        self.btn_labels = button("Labels: OFF", 130, self.cycle_labels)
+        self.btn_live = button("Live print: OFF", 150, self.toggle_live_print)
+        self.btn_pause = button("Pause", 90, self.toggle_pause)
+        row = arcade.gui.UIBoxLayout(vertical=False, space_between=6)
+        for b in (self.btn_labels, self.btn_live, button("Snapshot", 100, self.print_snapshot),
+                  button("Stability", 100, self.print_stability), button("Speed -", 90, lambda: self.change_speed(1 / 1.5)),
+                  button("Speed +", 90, lambda: self.change_speed(1.5)), self.btn_pause):
+            row.add(b)
+        root.add(row, anchor_x="left", anchor_y="top", align_x=10, align_y=-10)
+
+        # top-right panel: simulated time, how long to keep running, who is alive
+        self.ui_time = arcade.gui.UILabel("", text_color=arcade.color.WHITE, font_size=16)
+        self.ui_stop = arcade.gui.UILabel("", text_color=arcade.color.LIGHT_GRAY, font_size=16)
+        self.ui_alive = arcade.gui.UILabel("", text_color=arcade.color.LIGHT_GRAY, font_size=14)
+        panel = arcade.gui.UIBoxLayout(vertical=True, space_between=2, align="right")
+        for w in (self.ui_time, self.ui_stop, self.ui_alive):
+            panel.add(w)
+        root.add(panel, anchor_x="right", anchor_y="top", align_x=-12, align_y=-10)
+        self.UI.add(root)
+
+    def _nm(self, i):
+        """Display label of body i: its number in ID mode, its name otherwise."""
+        return str(i) if self.label_mode == "id" else self.names[i]
+
+    def _tn(self, i):
+        return self.names[int(i)]
+
+    @staticmethod
+    def _set_color(label, color):
+        try:
+            label.font_color = color
+        except Exception:
+            pass
+
+    def _refresh_hud(self, t, dt, n_alive, steps, elapsed):
+        if self.hud is not None and self.show_hud:
+            self.hud.text = (f"speed {self.achieved_speed:.3f}/{self.sim_speed:.3f} yr/s  steps/frame={steps}  "
+                             f"dt={dt:.1e}  work={elapsed * 1e3:.1f}ms")
+        self.ui_time.text = f"t = {t:,.3f} yr    alive {n_alive}/{self.n0}"
+        rep = self.report
+        if self.monitor is None:
+            text, col = "run time estimate: off (use --stability-every)", arcade.color.GRAY
+        elif rep is None:
+            text, col = "run time estimate: collecting data...", arcade.color.GRAY
+        else:
+            v, t_stop, rem = rep.stop_estimate()
+            if v == "SETTLED":
+                text, col = f"SETTLED - safe to stop (since t = {t_stop:,.2f} yr)", arcade.color.LIGHT_GREEN
+            elif v == "PENDING":
+                text, col = f"run until t = {t_stop:,.2f} yr  (+{rem:,.2f} yr)", arcade.color.YELLOW
+            else:
+                text, col = f"still evolving - earliest possible stop t = {t_stop:,.2f} yr", arcade.color.ORANGE
+        self.ui_stop.text = text
+        self._set_color(self.ui_stop, col)
+        if n_alive <= 8 and self._last_buf is not None:
+            buf = self._last_buf
+            ids = sorted(int(i) for i in buf[buf[:, 2] > 0, 3])
+            self.ui_alive.text = "alive: " + ", ".join(self._nm(i) for i in ids)
+        else:
+            self.ui_alive.text = ""
+
+    # ---------------------------------------------------------------- actions (buttons and keys share these)
+    def cycle_labels(self):
+        self.label_mode = {"off": "id", "id": "name", "name": "off"}[self.label_mode]
+        self.btn_labels.text = "Labels: " + self.label_mode.upper()
+        self._labels.clear()
+
+    def toggle_live_print(self):
+        self.live_print = not self.live_print
+        self.btn_live.text = "Live print: " + ("ON" if self.live_print else "OFF")
+        self._last_print = 0.0
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.btn_pause.text = "Resume" if self.paused else "Pause"
+
+    def change_speed(self, factor):
+        self.sim_speed *= factor
+
+    def print_snapshot(self):
+        """One-shot table of the heaviest live bodies (positions in AU about the system centre of mass)."""
+        d = self.sim.diagnostics()
+        rows = self.sim.fetch_log(20)
+        rows = rows[np.argsort(-rows[:, 4])] if len(rows) else rows
+        print(f"--- t = {d['t']:.4f} yr | alive {d['alive']}/{self.n0} | E = {d['total']:.6e} | "
+              f"Lz = {d['angular_momentum_z']:.5e} ---")
+        print(f"{'id':>5} {'name':<12} {'mass':>9} {'x [AU]':>11} {'y [AU]':>11} {'vx':>11} {'vy':>11}   members")
+        for x, y, vx, vy, m, i in rows:
+            i = int(i)
+            absorbed = len(self.members.get(i, [i])) - 1
+            print(f"{i:>5} {self.names[i]:<12} {m:>9.4g} {x:>11.4e} {y:>11.4e} {vx:>11.4e} {vy:>11.4e}   "
+                  f"{'+%d absorbed' % absorbed if absorbed else ''}")
+        if d["alive"] > len(rows):
+            print(f"      ... {d['alive'] - len(rows)} lighter bodies not shown")
+
+    def _update_report(self):
+        """Record a stability snapshot and turn the history into the current verdict / stop estimate."""
+        try:
+            if self.monitor is not None:
+                self.report = _finalize_report(self.monitor.record(self.sim), self.monitor.params, self.monitor)
+                return self.report
+            return self.sim.stability_report(verbose=False)
+        except Exception as e:  # never let diagnostics kill the window
+            print("[stability] report failed:", e)
+            return None
+
+    def print_stability(self):
+        rep = self._update_report()
+        if rep is not None:
+            print("[stability] " + (rep.summary() if VERBOSE else rep.brief(self._tn)))
+
+    def _report_merges(self, n_alive):
+        """Print every merge as one line and keep the 'who absorbed whom' bookkeeping for the labels."""
+        events, self.sim.merge_log = self.sim.merge_log, []
+        print("\n".join(merge_lines(events, self.names, self.members, n_alive)))
+
+    def _live_print(self, t, dt, n_alive):
+        now = time.perf_counter()
+        if now - self._last_print < 1.0:
+            return
+        self._last_print = now
+        print(f"t = {t:.3f} yr | alive {n_alive} | dt = {dt:.1e} | E = {float(self.sim.energy()):.6e} | "
+              f"{self.achieved_speed:.2f} yr/s")
 
     def _init_point_renderer(self, n):
         try:
@@ -1998,7 +2267,7 @@ class myEnvironment(arcade.Window):
                 [BufferDescription(self.pt_buf, "2f 1f", ["in_pos", "in_radius"], instanced=True)],
                 mode=self.ctx.TRIANGLE_STRIP)
             self.pt_ok = True
-            print("[render]  GPU point renderer OK")
+            say("[render]  GPU point renderer OK")
         except Exception as e:
             print("[render]  point shader failed, falling back to arcade.draw_points (slower):", e)
         self._draw_buf = np.empty((0, 4), np.float32)
@@ -2021,7 +2290,7 @@ class myEnvironment(arcade.Window):
             self.tr_buf.write(np.tile(xy0, (self.L, 1)).tobytes())      # no garbage before the ring fills
             self.tr_head = 0
             self.trails_gl = True
-            print(f"[render]  trails: every body, {self.L} points each ({self.L * self.n0:,} total)")
+            say(f"[render]  trails: every body, {self.L} points each ({self.L * self.n0:,} total)")
         except Exception as e:
             print("[render]  GPU trail renderer failed:", e)
             if self.n0 <= self.sprite_mode_max:
@@ -2052,26 +2321,32 @@ class myEnvironment(arcade.Window):
             self.achieved_speed = 0.9 * self.achieved_speed + 0.1 * (self.sim.t - t_before) / delta_time
 
         buf, t, dt, n_alive = self.sim.fetch_render(global_center_x, global_center_y)
+        self._last_buf = buf
         elapsed = time.perf_counter() - t_start
 
         self._show(buf)
         self.frame_count += 1
 
+        if self.sim.merge_log:
+            self._report_merges(n_alive)
+
         if self.frame_count % self.trail_every == 0:
             self._push_trail(buf)
 
         if self.log_every and self.frame_count % self.log_every == 0:
-            self._log(t, elapsed, dt, n_alive)
+            self._log(t)
 
         if self.group_every and self.frame_count % self.group_every == 0:
             self._log_groups(t)
 
         if self.monitor is not None and self.frame_count % self.stability_every == 0:
-            self.monitor.record(self.sim)
+            self._update_report()
 
-        if self.hud is not None and self.show_hud and self.frame_count % 6 == 0:
-            self.hud.text = (f"t={t:.3f} yr  speed {self.achieved_speed:.3f}/{self.sim_speed:.3f} yr/s  "
-                             f"steps/frame={steps}  dt={dt:.1e}  alive={n_alive}  work={elapsed * 1e3:.1f}ms")
+        if self.frame_count % 6 == 0:
+            self._refresh_hud(t, dt, n_alive, steps, elapsed)
+
+        if self.live_print:
+            self._live_print(t, dt, n_alive)
 
         n_rows = buf.shape[0]
         if n_rows - n_alive >= max(16, self.dead_fraction * n_rows):
@@ -2110,7 +2385,7 @@ class myEnvironment(arcade.Window):
         else:
             self._draw_buf = buf
 
-    def _log(self, t, elapsed, dt, n_alive):
+    def _log(self, t):
         energy = float(self.sim.energy())
         drift = (energy - self.E0) / abs(self.E0) if self.E0 != 0 else 0.0
         lz = float(self.sim.angular_momentum().sum())
@@ -2119,9 +2394,6 @@ class myEnvironment(arcade.Window):
         if rows.size:
             table = np.column_stack([np.full(len(rows), t), rows[:, 5], rows[:, 0:4], rows[:, 4]])
             np.savetxt(self.log_f, table, delimiter=",", fmt="%.9g")
-        if self.print_Debug:
-            print(f"t={t:.4f} dt={dt:.2e} steps/frame={self.last_steps} frame={elapsed * 1e3:.1f}ms "
-                  f"alive={n_alive} E={energy:.8e} drift={drift:.2e} Lz={lz:.6e}")
 
     def _log_groups(self, t):
         groups = self.sim.bound_groups(min_size=2, tidal=False)
@@ -2150,12 +2422,44 @@ class myEnvironment(arcade.Window):
         else:
             b = self._draw_buf
             arcade.draw_points([tuple(p) for p in b[b[:, 2] > 0][:20000, :2]], arcade.color.WHITE, 2)
+        # screen-space layer: labels, HUD, buttons
+        self.default_camera.use()
+        self._draw_labels()
         if self.hud is not None and self.show_hud:
             try:
-                self.default_camera.use()
                 self.hud.draw()
             except Exception:
                 self.hud = None
+        self.UI.draw()
+
+    def _draw_labels(self):
+        """Name / number next to every live body. World -> screen by hand: the label stays the same size at any zoom."""
+        buf = self._last_buf
+        if self.label_mode == "off" or buf is None:
+            return
+        rows = buf[buf[:, 2] > 0]
+        if len(rows) > self.label_max:
+            rows = rows[np.argsort(-rows[:, 2])[:self.label_max]]      # biggest bodies first
+        cx, cy = self.camera.position[0], self.camera.position[1]
+        z, hw, hh = float(self.camera.zoom), self.width / 2, self.height / 2
+        live = set()
+        for x, y, r, i in rows:
+            bid = int(i)
+            live.add(bid)
+            sx, sy = (float(x) - cx) * z + hw, (float(y) - cy) * z + hh
+            if sx < -80 or sy < -20 or sx > self.width + 80 or sy > self.height + 20:
+                continue
+            txt = _tracker_label(self.label_mode, bid, self.names, self.members)
+            lab = self._labels.get(bid)
+            if lab is None:
+                lab = self._labels[bid] = arcade.Text(txt, 0, 0, arcade.color.WHITE, 12)
+            elif lab.text != txt:
+                lab.text = txt
+            off = max(float(r) * z, 2.0) + 4.0
+            lab.x, lab.y = sx + off, sy + off
+            lab.draw()
+        for bid in [b for b in self._labels if b not in live]:         # merged away -> free the label
+            del self._labels[bid]
 
     def on_close(self):
         try:
@@ -2170,8 +2474,9 @@ class myEnvironment(arcade.Window):
             print("Error saving data:", e)
         try:
             if self.sim.mass.shape[0] <= 2000:
-                print("\nFinal state:")
-                self.sim.stability_report(monitor=self.monitor)
+                rep = self._update_report()
+                if rep is not None:
+                    print("\nFinal state  " + (rep.summary() if VERBOSE else rep.brief(self._tn)))
         except Exception as e:
             print("stability report failed:", e)
         super().on_close()
@@ -2188,48 +2493,40 @@ class myEnvironment(arcade.Window):
             global_center_x = self.center_x
             global_center_y = self.center_y
         elif symbol == arcade.key.SPACE:
-            self.paused = not self.paused
+            self.toggle_pause()
         elif symbol == arcade.key.P:
-            self.print_Debug = not self.print_Debug
+            self.toggle_live_print()
+        elif symbol == arcade.key.L:
+            self.cycle_labels()
+        elif symbol == arcade.key.N:
+            self.print_snapshot()
         elif symbol == arcade.key.E:
             self.sim.set_fixed_dt(not self.sim.fixed_dt)
             print(f"Fixed-dt mode: {'ON' if self.sim.fixed_dt else 'OFF'} (dt = {self.sim.fixed_dt_value})")
         elif symbol == arcade.key.UP:
-            self.sim_speed *= 1.5
-            print(f"sim speed: {self.sim_speed:.4f} yr/s")
+            self.change_speed(1.5)
         elif symbol == arcade.key.DOWN:
-            self.sim_speed /= 1.5
-            print(f"sim speed: {self.sim_speed:.4f} yr/s")
+            self.change_speed(1 / 1.5)
         elif symbol == arcade.key.RIGHT:
             self.step_budget_ms = min(14.0, self.step_budget_ms + 1.0)
-            print(f"step budget: {self.step_budget_ms:.0f} ms/frame")
         elif symbol == arcade.key.LEFT:
             self.step_budget_ms = max(1.0, self.step_budget_ms - 1.0)
-            print(f"step budget: {self.step_budget_ms:.0f} ms/frame")
         elif symbol == arcade.key.A:
             self.show_hud = not self.show_hud
         elif symbol == arcade.key.T:
             self.trail_fade = not self.trail_fade
-            print(f"trail fade: {'ON' if self.trail_fade else 'OFF'}")
         elif symbol == arcade.key.B:
             self.sim.calculate_dynamics()
         elif symbol == arcade.key.S:
-            self.sim.stability_report(monitor=self.monitor)
+            self.print_stability()
         elif symbol == arcade.key.D:
             d = self.sim.diagnostics()
             print(f"t={d['t']:.4f} yr  alive={d['alive']}  KE={d['kinetic']:.6e}  PE={d['potential']:.6e}  "
                   f"E={d['total']:.6e}  virial 2KE/|PE|={d['virial']:.3f}  Lz={d['angular_momentum_z']:.6e}")
 
-    def on_mouse_press(self, x, y, button, modifiers):
-        if button == arcade.MOUSE_BUTTON_LEFT:
-            self.dragging = True
-
-    def on_mouse_release(self, x, y, button, modifiers):
-        if button == arcade.MOUSE_BUTTON_LEFT:
-            self.dragging = False
-
-    def on_mouse_motion(self, x, y, dx, dy):
-        if self.dragging:
+    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+        # the buttons consume their own clicks/drags (UIManager handles events first), so this only pans the scene
+        if buttons & arcade.MOUSE_BUTTON_LEFT:
             z = self.camera.zoom
             self.camera.position = (self.camera.position[0] - dx / z, self.camera.position[1] - dy / z)
 
@@ -2241,7 +2538,15 @@ class myEnvironment(arcade.Window):
 
 
 if __name__ == "__main__":
+    if "--headless" in sys.argv:               # no window: hand over to the fast runner (all its options apply)
+        import nbody_headless
+        sys.exit(nbody_headless.main([a for a in sys.argv[1:] if a != "--headless"]))
+
     ap = argparse.ArgumentParser()
+    ap.add_argument("--verbose", action="store_true",
+                    help="print the set-up details and the long reports (default: only events and short reports)")
+    ap.add_argument("--headless", action="store_true",
+                    help="no window: run nbody_headless.py (much faster; see python nbody_headless.py -h)")
     ap.add_argument("--float32", action="store_true", help="everything in float32")
     ap.add_argument("--force-fp32", action="store_true", help="(now the default on CUDA) forces in float32")
     ap.add_argument("--fp64-force", action="store_true", help="forces in float64 (slow on consumer GPUs)")
@@ -2265,6 +2570,7 @@ if __name__ == "__main__":
                     help="fade older trail points out (default: off, trails keep full opacity)")
     ap.add_argument("--set-high-perf-gpu", action="store_true")
     args = ap.parse_args()
+    VERBOSE = args.verbose
 
     if args.set_high_perf_gpu:
         set_windows_gpu_preference()
